@@ -9,3 +9,5 @@ tqdm
 rouge_score
 wandb==0.12.10
 sentencepiece==0.1.96
+accelerate
+adapter-transformers

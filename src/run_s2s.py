@@ -30,12 +30,17 @@ import nltk  # Here to have a nice missing dependency error message early on
 import numpy as np
 from datasets.utils import set_progress_bar_enabled
 from datasets import load_dataset, load_metric
-
+from accelerate import init_empty_weights
 import transformers
 from filelock import FileLock
 from transformers import (
     AutoConfig,
     AutoModelForSeq2SeqLM,
+    # OPTForCausalLM,
+    # OPTModel,
+    GPT2Model,
+    GPT2Tokenizer,
+    GPT2TokenizerFast,
     AutoTokenizer,
     DataCollatorForSeq2Seq,
     HfArgumentParser,
@@ -47,10 +52,11 @@ from transformers import (
     Seq2SeqTrainingArguments,
     set_seed,
 )
+# from transformers.adapters import T5AdapterModel
 from transformers.file_utils import is_offline_mode
 from transformers.trainer_utils import get_last_checkpoint
-from ni_collator import DataCollatorForNI
-from ni_trainer import NITrainer, DenserEvalCallback
+from ni_collator import DataCollatorForNI, DataCollatorForNIDenoising
+from ni_trainer import NIAdapterTrainer, NITrainer, DenserEvalCallback
 from compute_metrics import compute_metrics, compute_grouped_metrics
 
 set_progress_bar_enabled(False)
@@ -79,6 +85,7 @@ class ModelArguments:
     model_name_or_path: str = field(
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
+    enable_adapter: Optional[bool] = field(default=False, metadata={"help": "Enable adapter"})
     config_name: Optional[str] = field(
         default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
     )
@@ -111,6 +118,15 @@ class ModelArguments:
             "the model's position embeddings."
         },
     )
+    is_model_parallel: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether to use model parallel."},
+    )
+    adapter_composition_type: Optional[str] = field(
+        default=None,
+        metadata={"help": "Whether to stack adapters."},
+    )
+    
 
 
 @dataclass
@@ -230,6 +246,16 @@ class DataTrainingArguments:
         default=False,
         metadata={"help": "tk_instruct will train a model combining all valid instruction encodings. This will overwrite the other settings about instruction encoding."} 
     )
+
+    noise_density: Optional[float] = field(
+        default=0.4,
+        metadata={"help": "The density of noise to add to the data."}
+    )
+
+    mean_noise_span_length: Optional[int] = field(
+        default=3.0,
+        metadata={"help": "mean noise span length"}
+    )
     
     def __post_init__(self):
         pass
@@ -242,7 +268,14 @@ class NITrainingArguments(Seq2SeqTrainingArguments):
         metadata={"help": "If specifid, the model will do more evaluation at the beginning of training."}
     )
     do_demo: bool = field(default=False, metadata={"help": "Whether to run the model as a demo in the terminal."})
+    denoise: bool = field(default=False, metadata={"help": "Whether to run the model for denoising objective."})
+    denoise_obj: str = field(default="definition", metadata={"help": "Whether to run the model for denoising objective."})
 
+
+
+def switch_adapter(model, adapter_name):
+    model.active_adapter = adapter_name
+    model.train_adapter(adapter_name)
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -322,37 +355,150 @@ def main():
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
+    import pdb; pdb.set_trace()
+    model_args.config_name = "t5-large"
+    print('model path')
+    
     config = AutoConfig.from_pretrained(
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        use_fast=model_args.use_fast_tokenizer,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-    )
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        config=config,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-    )
+    # ValueError: Currenty GPT2's fast tokenizer does NOT support adding a BOS token.Instead you should use GPT2's slow tokenizer
+    if "gpt" in model_args.model_name_or_path or "opt" in model_args.model_name_or_path:
+        model_args.use_fast_tokenizer = False
+    if "opt" in model_args.model_name_or_path or "gpt" in model_args.model_name_or_path:
+        # tokenizer = GPT2TokenizerFast.from_pretrained(
+        #     model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+        #     cache_dir=model_args.cache_dir,
+        #     use_fast=model_args.use_fast_tokenizer,
+        #     revision=model_args.model_revision,
+        #     use_auth_token=True if model_args.use_auth_token else None,
+        # )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast_tokenizer,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+        assert training_args.denoise == False, "Denoising is not supported for GPT2"
+    else:
+        
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast_tokenizer,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+
+    
+    if "opt" in model_args.model_name_or_path:
+        if training_args.resume_from_checkpoint:
+            # with init_empty_weights():
+            #     model = OPTForCausalLM.from_pretrained(
+            #         model_args.model_name_or_path)
+            model = OPTForCausalLM.from_pretrained(
+                    training_args.resume_from_checkpoint,
+                    low_cpu_mem_usage = True)
+        else:
+            model = OPTForCausalLM.from_pretrained(
+                    model_args.model_name_or_path)
+        
+        # model = OPTModel.from_pretrained(model_args.model_name_or_path, config=config)
+        # with init_empty_weights():
+        #     model = OPTForCausalLM.from_pretrained(model_args.model_name_or_path)
+        # load_checkpoint_in_model(model.model,
+        #                 weights_path,
+        #                 device_map=device_map,
+        #                 dtype='float16', 
+        #             )
+    elif "gpt" in model_args.model_name_or_path:
+        
+        model = GPT2Model.from_pretrained(model_args.model_name_or_path) 
+        # model = GPT2WithLMHead.from_pretrained(model_args.model_name_or_path) out-dated
+        # tokenizer = GPT2Tokenizer.from_pretrained(model_args.model_name_or_path)
+        # tokenizer.add_special_tokens({'pad_token': '[PAD]'}) # TODO: check [PAD] token
+        # model.resize_token_embeddings(len(tokenizer))
+    else:
+        # if model_args.enable_adapter:
+        #     model = T5AdapterModel.from_pretrained(
+        #         model_args.model_name_or_path,
+        #         from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        #         config=config,
+        #         cache_dir=model_args.cache_dir,
+        #         revision=model_args.model_revision,
+        #         use_auth_token=True if model_args.use_auth_token else None,
+        #     )
+        #     model.add_adapter(model_args.model_name_or_path)
+        #     model.add_seq2seq_lm_head(model_args.model_name_or_path)
+        #     model.active_adapters = model_args.model_name_or_path
+        #     model.train_adapter(model_args.model_name_or_path)
+
+        # else:
+        #     model = AutoModelForSeq2SeqLM.from_pretrained(
+        #         model_args.model_name_or_path,
+        #         from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        #         config=config,
+        #         cache_dir=model_args.cache_dir,
+        #         revision=model_args.model_revision,
+        #         use_auth_token=True if model_args.use_auth_token else None,
+        #     )
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_args.model_name_or_path,
+                from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                config=config,
+                cache_dir=model_args.cache_dir,
+                revision=model_args.model_revision,
+                use_auth_token=True if model_args.use_auth_token else None,
+            )
+        import transformers.adapters.composition as ac
+        import pdb; pdb.set_trace()
+        print('')
+        
+        if model_args.enable_adapter:
+            if model_args.stack_adapters:
+                if os.path.exists(model_args.model_name_or_path):
+                    for i in range(10):
+                        model.add_adapter(os.path.join(model_args.model_name_or_path, "i"))
+                for i in range(10):
+                    model.add_adapter(str(i))
+            
+                if model_args.adapter_composition_type == "parallel":
+                    model.set_active_adapters(ac.Parallel(**[str(i) for i in range(10)]))
+                elif model_args.adapter_composition_type == "stack":
+                    model.set_active_adapters(ac.Stack(**[str(i) for i in range(10)]))
+                elif model_args.adapter_composition_type == "fuse":
+                    model.add_adapter_fusion([str(i) for i in range(10)])
+                    model.set_active_adapters(ac.Fuse(**[str(i) for i in range(10)]))
+                elif model_args.adapter_composition_type == "None":
+                    pass
+                else:
+                    raise ValueError("Unknown adapter composition type")
+
+
+            else:
+                for i in range(10):
+                    model.add_adapter(str(i))
+                    model.set_active_adapters(str(i))
+                    model.train_adapter(str(i)) # useless as it will be switched anyway
 
     model.resize_token_embeddings(len(tokenizer))
+
+
+    if model_args.is_model_parallel:
+        model.parallelize()
 
     if model.config.decoder_start_token_id is None and isinstance(tokenizer, (MBartTokenizer, MBartTokenizerFast)):
         if isinstance(tokenizer, MBartTokenizer):
             model.config.decoder_start_token_id = tokenizer.lang_code_to_id[data_args.lang]
         else:
             model.config.decoder_start_token_id = tokenizer.convert_tokens_to_ids(data_args.lang)
-
-    if model.config.decoder_start_token_id is None:
+    # NOTE: decoder-only model doesn't need decoder_start_token_id
+    # https://stackoverflow.com/questions/64904840/why-we-need-a-decoder-start-token-id-during-generation-in-huggingface-bart
+    if model.config.decoder_start_token_id is None and "opt" not in model_args.model_name_or_path and "gpt" not in model_args.model_name_or_path:
         raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
 
     if (
@@ -419,21 +565,46 @@ def main():
 
     # Data collator
     label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
-    data_collator = DataCollatorForNI(
-        tokenizer,
-        model=model,
-        padding="max_length" if data_args.pad_to_max_length else "longest",
-        max_source_length=data_args.max_source_length,
-        max_target_length=data_args.max_target_length,
-        label_pad_token_id=label_pad_token_id,
-        pad_to_multiple_of=8 if training_args.fp16 else None,
-        add_task_name=data_args.add_task_name,
-        add_task_definition=data_args.add_task_definition,
-        num_pos_examples=data_args.num_pos_examples,
-        num_neg_examples=data_args.num_neg_examples,
-        add_explanation=data_args.add_explanation,
-        tk_instruct=data_args.tk_instruct
-    )
+    if not training_args.denoise:
+        data_collator = DataCollatorForNI(
+            tokenizer,
+            model=model,
+            padding="max_length" if data_args.pad_to_max_length else "longest",
+            max_source_length=data_args.max_source_length,
+            max_target_length=data_args.max_target_length,
+            label_pad_token_id=label_pad_token_id,
+            pad_to_multiple_of=8 if training_args.fp16 else None,
+            add_task_name=data_args.add_task_name,
+            add_task_definition=data_args.add_task_definition,
+            num_pos_examples=data_args.num_pos_examples,
+            num_neg_examples=data_args.num_neg_examples,
+            add_explanation=data_args.add_explanation,
+            tk_instruct=data_args.tk_instruct
+        )
+    else:
+        # import pdb; pdb.set_trace()
+        # print('checkpoint: debug denoising data collator')
+        
+        data_collator = DataCollatorForNIDenoising(
+            tokenizer,
+            model=model,
+            padding="max_length" if data_args.pad_to_max_length else "longest",
+            max_source_length=data_args.max_source_length,
+            max_target_length=data_args.max_target_length,
+            label_pad_token_id=label_pad_token_id,
+            pad_to_multiple_of=8 if training_args.fp16 else None,
+            add_task_name=data_args.add_task_name,
+            add_task_definition=data_args.add_task_definition,
+            num_pos_examples=data_args.num_pos_examples,
+            num_neg_examples=data_args.num_neg_examples,
+            add_explanation=data_args.add_explanation,
+            tk_instruct=data_args.tk_instruct,
+            noise_density = data_args.noise_density,
+            mean_noise_span_length = data_args.mean_noise_span_length,
+            decoder_start_token_id = label_pad_token_id, # temporary setting for T5
+            denoise_obj= training_args.denoise_obj,
+        )
+
     # we don't want to remove unused columns because we will prepare each batch during training, 
     # and some of the information will aslo be used in evaluation.
     training_args.remove_unused_columns = False 
@@ -462,18 +633,29 @@ def main():
                         "Prediction": pred
                     }) + "\n")
         return result
-
-    # Initialize our Trainer
-    trainer = NITrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_ni_metrics if training_args.predict_with_generate else None,
-        callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None
-    )
+    if model_args.enable_adapter:
+        trainer = NIAdapterTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset if training_args.do_train else None,
+            eval_dataset=eval_dataset if training_args.do_eval else None,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+            compute_metrics=compute_ni_metrics if training_args.predict_with_generate else None,
+            callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
+        )
+    else:
+        # Initialize our Trainer
+        trainer = NITrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset if training_args.do_train else None,
+            eval_dataset=eval_dataset if training_args.do_eval else None,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+            compute_metrics=compute_ni_metrics if training_args.predict_with_generate else None,
+            callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
+        )
 
     all_metrics = {"run_name": training_args.run_name}
 
@@ -484,6 +666,7 @@ def main():
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
+
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()  # Saves the tokenizer too for easy upload
 
@@ -521,7 +704,7 @@ def main():
 
     if training_args.do_predict:
         logger.info("*** Predict ***")
-
+        
         predict_results = trainer.predict(
             predict_dataset, metric_key_prefix="predict", max_length=max_length, num_beams=num_beams
         )

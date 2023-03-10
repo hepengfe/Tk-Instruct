@@ -45,7 +45,7 @@ if __name__ == "__main__":
         add_explanation=args.add_explanation,
         text_only=True
     )
-
+    print("make dirs")
     os.makedirs(customized_args.output_dir, exist_ok=True)
 
     for split in ["train", "test"]:

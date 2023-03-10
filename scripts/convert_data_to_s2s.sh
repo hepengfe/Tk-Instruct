@@ -1,6 +1,6 @@
-data_dir=data/splits/default
-task_dir=data/tasks/
-output_dir=data/text2text
+data_dir=/home/murphy/pengfei_2022/Tk-Instruct/data/splits/default
+task_dir=/home/murphy/pengfei_2022/Tk-Instruct/data/tasks/
+output_dir=/home/murphy/pengfei_2022/Tk-Instruct/data/text2text
 
 python src/convert_data_to_s2s.py \
     --data_dir $data_dir \
